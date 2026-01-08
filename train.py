@@ -130,7 +130,7 @@ if __name__ == "__main__":
 
     # 训练超参数
     parser.add_argument("--crop_size", type=int, default=512)
-    parser.add_argument("--batch_size", type=int, default=6, help="根据显存调整，建议 8 或 16")
+    parser.add_argument("--batch_size", type=int, default=10, help="根据显存调整，建议 8 或 16")
     parser.add_argument("--epochs", type=int, default=3, help="总训练轮数")
     parser.add_argument("--lr", type=float, default=0.001, help="初始学习率")
 

@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
+from torchinfo import summary
 
 
 class Light_Residual_block (nn.Module):
@@ -62,10 +63,10 @@ class Vascular_structure_enhancer(nn.Module):
                                  kernel_size=7, stride=1, padding=(7 // 2), padding_mode='reflect', bias=False)
         self.DWCONv9 = nn.Conv2d(in_channels=output_channels, out_channels=output_channels, groups=output_channels,
                                  kernel_size=9, stride=1, padding=(9 // 2), padding_mode='reflect', bias=False)
-        self.DWCONv11 = nn.Conv2d(in_channels=output_channels, out_channels=output_channels, groups=output_channels,
-                                  kernel_size=11, stride=1, padding=(11 // 2), padding_mode='reflect', bias=False)
+        # self.DWCONv11 = nn.Conv2d(in_channels=output_channels, out_channels=output_channels, groups=output_channels,
+        #                           kernel_size=11, stride=1, padding=(11 // 2), padding_mode='reflect', bias=False)
         self.identity = nn.Identity()
-        self.CONv1_1 = nn.Conv2d(in_channels=(output_channels * 5), out_channels=output_channels, kernel_size=1,
+        self.CONv1_1 = nn.Conv2d(in_channels=(output_channels * 4), out_channels=output_channels, kernel_size=1,
                                  stride=1, padding=0, bias=False)
         self.bn2 = nn.BatchNorm2d(output_channels)
         self.CONv1_2 = nn.Conv2d(in_channels=output_channels, out_channels=output_channels, kernel_size=1,
@@ -80,9 +81,9 @@ class Vascular_structure_enhancer(nn.Module):
         x1 = self.DWCONv5(x)
         x2 = self.DWCONv7(x)
         x3 = self.DWCONv9(x)
-        x4 = self.DWCONv11(x)
+        # x4 = self.DWCONv11(x)
         x5 = self.identity(x)
-        out = torch.cat((x1, x2, x3, x4, x5), dim=1)
+        out = torch.cat((x1, x2, x3, x5), dim=1)
         r1 = self.CONv1_1(out)
         r1 = self.bn2(r1)
         r1 = self.swish(r1)
@@ -230,26 +231,37 @@ class Denoiser(nn.Module):
         self.encoder=Encoder()
         self.bridge=Bridge()
         self.decoder=Decoder()
-        self.vascular_structure_enhancer=Vascular_structure_enhancer(input_channels=96,output_channels=96)
+        # self.vascular_structure_enhancer=Vascular_structure_enhancer(input_channels=96,output_channels=96)
         self.transformer_unit=Transformer_unit()
     def forward(self,x):
         out1,out2,out3=self.encoder(x)
         bridge=self.bridge(out3)
         decoder_1,decoder_2,decoder_3=self.decoder(bridge,out1,out2,out3)
-        decoder_3=self.vascular_structure_enhancer(decoder_3)
+        # decoder_3=self.vascular_structure_enhancer(decoder_3)
         transformed_decoder_1, transformed_decoder_2, transformed_decoder_3=self.transformer_unit(decoder_3,decoder_2,decoder_1)
 
 
         return transformed_decoder_1,transformed_decoder_2,transformed_decoder_3
 
 
-
-
 if __name__ == "__main__":
+    # 实例化模型
     net = Denoiser().cpu()
+
+    # 模拟输入
     x = torch.randn(1, 1, 224, 224)
+
+    # 前向传播测试
     t1, t2, t3 = net(x)
-    print(t1.shape, t2.shape, t3.shape)
+    print("---------------------------------------")
+    print(f"Model Output Shapes: {t1.shape}, {t2.shape}, {t3.shape}")
+    print("---------------------------------------")
+
+    # 统计参数量
+    total_params = sum(p.numel() for p in net.parameters())
+    trainable_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
+    print(f"Total Params: {total_params / 1e6:.4f} M")
+    print(f"Trainable Params: {trainable_params / 1e6:.4f} M")
 
 
 
