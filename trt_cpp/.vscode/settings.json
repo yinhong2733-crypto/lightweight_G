@@ -1,0 +1,11 @@
+{
+    "cmake.generator": "Visual Studio 18 2026",
+    "cmake.autoSelectKit": false,
+    "cmake.preferredGenerators": ["Visual Studio 18 2026"],
+    "cmake.additionalCompilerSearchDirs": [
+        "C:/Program Files (x86)/Microsoft Visual Studio/18/BuildTools/VC/Tools/MSVC/14.50.35717/bin/Hostx64/x64"
+    ],
+    "cmake.buildDirectory": "${workspaceFolder}/build",
+    "cmake.buildType": "Release",  // 核心：锁死默认编译模式为Release
+    "cmake.defaultBuildType": "Release"  // 额外兜底：新配置默认Release
+}
