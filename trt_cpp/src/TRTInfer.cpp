@@ -1,73 +1,59 @@
 ﻿#include "TRTInfer.h"
 #include <cuda_runtime_api.h>
 #include <fstream>
-#include <iostream>
 
 bool TRTInfer::initEngine(const std::string& engine_path) {
     release();
-    // 1. 以二进制模式读取引擎文件
     std::ifstream file(engine_path, std::ios::binary);
-    if (!file.is_open()) {
-        std::cerr << "无法打开引擎文件: " << engine_path << std::endl;
-        return false;
-    }
-
+    if (!file.is_open()) return false;
     file.seekg(0, std::ios::end);
-    size_t file_size = file.tellg();
+    size_t size = file.tellg();
     file.seekg(0, std::ios::beg);
+    std::vector<char> data(size);
+    file.read(data.data(), size);
 
-    std::vector<char> engine_data(file_size);
-    file.read(engine_data.data(), file_size);
-    file.close();
-
-    // 2. 核心：反序列化引擎
     runtime = nvinfer1::createInferRuntime(logger);
-    engine = runtime->deserializeCudaEngine(engine_data.data(), file_size);
+    engine = runtime->deserializeCudaEngine(data.data(), size);
     if (!engine) return false;
-
-    // 3. 创建执行上下文（类似于启动一个计算线程）
     context = engine->createExecutionContext();
     return true;
 }
 
 std::vector<float> TRTInfer::infer(const std::vector<float>& input_data, int h, int w) {
-    std::vector<float> output_data;
-    if (!context || !engine) return output_data;
+    if (!context || !engine) return {};
 
-    // 获取输入/输出绑定（0号通常是Input, 1号通常是Output）
-    int nbBindings = engine->getNbBindings();
-    std::vector<void*> device_ptrs(nbBindings, nullptr);
-    std::vector<size_t> binding_sizes(nbBindings, 0);
+    const char* in_name = "input";
+    const char* out_name = "output";
 
-    for (int i = 0; i < nbBindings; ++i) {
-        nvinfer1::Dims dims = engine->getBindingDimensions(i);
-        size_t size = 1;
-        for (int j = 0; j < dims.nbDims; j++) {
-            size *= (dims.d[j] > 0) ? dims.d[j] : 1;
-        }
-        binding_sizes[i] = size * sizeof(float);
-        // 在显卡（GPU）上分配内存
-        cudaMalloc(&device_ptrs[i], binding_sizes[i]);
-    }
+    // 设置动态输入的实际尺寸，这决定了本次推理的计算量
+    nvinfer1::Dims dims = engine->getTensorShape(in_name);
+    dims.d[0] = 1; dims.d[1] = 1; dims.d[2] = h; dims.d[3] = w;
+    context->setInputShape(in_name, dims);
 
-    // A. CPU -> GPU: 拷贝输入数据
-    cudaMemcpy(device_ptrs[0], input_data.data(), binding_sizes[0], cudaMemcpyHostToDevice);
-    
-    // B. GPU 计算: 执行推理
-    context->executeV2(device_ptrs.data());
-    
-    // C. GPU -> CPU: 拷回处理结果
-    output_data.resize(binding_sizes[1] / sizeof(float));
-    cudaMemcpy(output_data.data(), device_ptrs[1], binding_sizes[1], cudaMemcpyDeviceToHost);
+    size_t total_elements = 1 * 1 * h * w;
+    void *d_in, *d_out;
+    cudaMalloc(&d_in, total_elements * sizeof(float));
+    cudaMalloc(&d_out, total_elements * sizeof(float));
 
-    // D. 清理本次推理申请的临时显存
-    for (void* ptr : device_ptrs) cudaFree(ptr);
-    return output_data;
+    // 绑定显存地址
+    context->setTensorAddress(in_name, d_in);
+    context->setTensorAddress(out_name, d_out);
+
+    cudaMemcpy(d_in, input_data.data(), total_elements * sizeof(float), cudaMemcpyHostToDevice);
+    context->enqueueV3(0); 
+    cudaStreamSynchronize(0); // 必须同步以确保结果已写入显存
+
+    std::vector<float> results(total_elements);
+    cudaMemcpy(results.data(), d_out, total_elements * sizeof(float), cudaMemcpyDeviceToHost);
+
+    cudaFree(d_in);
+    cudaFree(d_out);
+    return results;
 }
 
 void TRTInfer::release() {
-    if (context) context->destroy();
-    if (engine) engine->destroy();
-    if (runtime) runtime->destroy();
+    if (context) delete context;
+    if (engine) delete engine;
+    if (runtime) delete runtime;
     context = nullptr; engine = nullptr; runtime = nullptr;
 }

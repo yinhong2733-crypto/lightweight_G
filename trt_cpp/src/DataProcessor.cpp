@@ -1,9 +1,8 @@
 #include "DataProcessor.h"
 #include <fstream>
-#include <iostream>
 #include <regex>
 
-// 1. 读取 NPY (包含之前的修复)
+// NPY 读取：通过解析文件头获取准确的 shape，并使用 seekg 定位数据区
 std::vector<float> DataProcessor::loadNpyUltimate(const std::string& filename, int& out_h, int& out_w) {
     std::ifstream file(filename, std::ios::binary);
     if (!file.is_open()) return {};
@@ -16,14 +15,9 @@ std::vector<float> DataProcessor::loadNpyUltimate(const std::string& filename, i
     file.read(reinterpret_cast<char*>(&minor), 1);
 
     uint32_t header_len = 0;
-    int header_size_field = (major == 1) ? 2 : 4; // 计算长度字段本身占用的字节数
-
-    if (major == 1) {
-        uint16_t tmp; file.read(reinterpret_cast<char*>(&tmp), 2);
-        header_len = tmp;
-    } else {
-        file.read(reinterpret_cast<char*>(&header_len), 4);
-    }
+    int header_size_field = (major == 1) ? 2 : 4; 
+    if (major == 1) { uint16_t tmp; file.read(reinterpret_cast<char*>(&tmp), 2); header_len = tmp; }
+    else { file.read(reinterpret_cast<char*>(&header_len), 4); }
 
     std::string header(header_len, ' ');
     file.read(&header[0], header_len);
@@ -35,12 +29,11 @@ std::vector<float> DataProcessor::loadNpyUltimate(const std::string& filename, i
         out_w = std::stoi(match[2]);
     }
 
-    // 绝对定位数据区：Magic(6) + Ver(2) + LenField(2 or 4) + HeaderLen
+    // 跳转到数据起始位置
     int data_start = 6 + 2 + header_size_field + header_len;
     file.seekg(data_start, std::ios::beg);
 
     std::vector<float> result(out_h * out_w);
-    // 判断数据类型是否为 double ('f8')
     if (header.find("'f8'") != std::string::npos || header.find("<f8") != std::string::npos) {
         std::vector<double> temp_d(out_h * out_w);
         file.read(reinterpret_cast<char*>(temp_d.data()), out_h * out_w * sizeof(double));
@@ -51,48 +44,55 @@ std::vector<float> DataProcessor::loadNpyUltimate(const std::string& filename, i
     return result;
 }
 
-// 2. 预处理 (Resize -> Log)
-std::vector<float> DataProcessor::preprocess(const cv::Mat& raw_img, int target_size) {
-    cv::Mat resized, log_img;
-    cv::resize(raw_img, resized, cv::Size(target_size, target_size));
-    cv::max(resized, 0.0f, resized); // 去负值
-    cv::log(resized + 1.0f, log_img); // Log1p
+// 预处理：不再 Resize，直接对原图进行像素级 Box-Cox 变换
+std::vector<float> DataProcessor::preprocess(const cv::Mat& raw_img, float lam, float eps) {
+    cv::Mat u, y;
+    cv::max(raw_img, 0.0f, raw_img); // 修正可能存在的负值
+    cv::add(raw_img, 1.0f + eps, u); 
+    cv::pow(u, lam, y);
+    cv::subtract(y, 1.0f, y);
+    cv::divide(y, lam, y);
     
-    // 转换为 float 向量
-    if (log_img.isContinuous()) {
-        return std::vector<float>((float*)log_img.data, (float*)log_img.data + target_size * target_size);
+    // 返回一维向量供 TensorRT 使用
+    if (y.isContinuous()) {
+        return std::vector<float>((float*)y.data, (float*)y.data + y.total());
     } else {
-        // 防止非连续内存（虽然resize后通常是连续的）
-        std::vector<float> vec; 
-        log_img = log_img.reshape(1, 1);
-        log_img.copyTo(vec);
-        return vec;
+        cv::Mat cont = y.clone();
+        return std::vector<float>((float*)cont.data, (float*)cont.data + cont.total());
     }
 }
 
-// 3. 后处理 (Exp -> Resize -> Normalize 0-255)
-cv::Mat DataProcessor::postprocess(const std::vector<float>& infer_out, int orig_w, int orig_h, int model_size) {
-    cv::Mat out_log(model_size, model_size, CV_32FC1, (void*)infer_out.data());
-    cv::Mat res_small;
-    
-    cv::exp(out_log, res_small);
-    res_small -= 1.0f; // 还原 Log1p
+// 后处理：执行反向变换，并使用 NORM_MINMAX 归一化解决黑图问题
+cv::Mat DataProcessor::postprocess(const std::vector<float>& infer_out, int w, int h, float lam, float eps) {
+    cv::Mat y(h, w, CV_32FC1, (void*)infer_out.data());
+    cv::Mat u, x, final_8u;
 
-    cv::Mat res_big;
-    cv::resize(res_small, res_big, cv::Size(orig_w, orig_h), 0, 0, cv::INTER_CUBIC);
+    cv::multiply(y, lam, u);
+    cv::add(u, 1.0f, u);
+    cv::max(u, eps, u); 
+    cv::pow(u, 1.0f / lam, x);
+    cv::subtract(x, 1.0f + eps, x);
 
-    // 归一化并转为 8位图像保存
-    cv::Mat final_8u;
-    cv::normalize(res_big, final_8u, 0, 255, cv::NORM_MINMAX);
+    // 自动将图像拉伸到 0-255 亮度范围
+    cv::normalize(x, final_8u, 0, 255, cv::NORM_MINMAX);
     final_8u.convertTo(final_8u, CV_8U);
     return final_8u;
 }
 
-// 4. 可视化辅助保存 (用于保存原图)
-void DataProcessor::saveVisualImage(const cv::Mat& raw_float_img, const std::string& save_path) {
-    cv::Mat vis_8u;
-    // 将 float 数据归一化到 0-255 之间以便查看
-    cv::normalize(raw_float_img, vis_8u, 0, 255, cv::NORM_MINMAX);
-    vis_8u.convertTo(vis_8u, CV_8U);
-    cv::imwrite(save_path, vis_8u);
+void DataProcessor::saveVisualImage(const cv::Mat& img, const std::string& save_path, const std::string& info_text) {
+    cv::Mat vis;
+    if (img.depth() != CV_8U) {
+        cv::normalize(img, vis, 0, 255, cv::NORM_MINMAX);
+        vis.convertTo(vis, CV_8U);
+    } else {
+        vis = img.clone();
+    }
+
+    cv::Mat vis_color;
+    cv::cvtColor(vis, vis_color, cv::COLOR_GRAY2BGR);
+    if (!info_text.empty()) {
+        cv::putText(vis_color, info_text, cv::Point(20, 40), 
+                    cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 0), 2);
+    }
+    cv::imwrite(save_path, vis_color);
 }
