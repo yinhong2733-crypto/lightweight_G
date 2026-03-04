@@ -1,12 +1,14 @@
 #include "DataProcessor.h"
 #include <fstream>
 #include <regex>
+#include <cmath>
+#include <algorithm>
 
-// NPY 读取：通过解析文件头获取准确的 shape，并使用 seekg 定位数据区
 std::vector<float> DataProcessor::loadNpyUltimate(const std::string& filename, int& out_h, int& out_w) {
     std::ifstream file(filename, std::ios::binary);
     if (!file.is_open()) return {};
 
+    // 校验 numpy 魔数头是否正确
     char magic[6]; file.read(magic, 6);
     if (std::string(magic, 6) != "\x93NUMPY") return {};
 
@@ -14,6 +16,7 @@ std::vector<float> DataProcessor::loadNpyUltimate(const std::string& filename, i
     file.read(reinterpret_cast<char*>(&major), 1);
     file.read(reinterpret_cast<char*>(&minor), 1);
 
+    // 解析 Header 长度信息
     uint32_t header_len = 0;
     int header_size_field = (major == 1) ? 2 : 4; 
     if (major == 1) { uint16_t tmp; file.read(reinterpret_cast<char*>(&tmp), 2); header_len = tmp; }
@@ -22,6 +25,7 @@ std::vector<float> DataProcessor::loadNpyUltimate(const std::string& filename, i
     std::string header(header_len, ' ');
     file.read(&header[0], header_len);
 
+    // 用正则表达式提取 tuple 表示的图片尺寸 (H, W)
     std::regex shape_regex(R"(\((\d+),\s*(\d+)\))");
     std::smatch match;
     if (std::regex_search(header, match, shape_regex)) {
@@ -29,65 +33,48 @@ std::vector<float> DataProcessor::loadNpyUltimate(const std::string& filename, i
         out_w = std::stoi(match[2]);
     }
 
-    // 跳转到数据起始位置
     int data_start = 6 + 2 + header_size_field + header_len;
     file.seekg(data_start, std::ios::beg);
 
     std::vector<float> result(out_h * out_w);
+    // 判断 Numpy 是 float64('f8') 还是 float32('f4')
     if (header.find("'f8'") != std::string::npos || header.find("<f8") != std::string::npos) {
+        // 如果是双精度，先读取进来再强转为单精度 (float) 以对齐模型输入
         std::vector<double> temp_d(out_h * out_w);
         file.read(reinterpret_cast<char*>(temp_d.data()), out_h * out_w * sizeof(double));
         for(size_t i = 0; i < temp_d.size(); ++i) result[i] = static_cast<float>(temp_d[i]);
     } else {
+        // 单精度直接拷贝
         file.read(reinterpret_cast<char*>(result.data()), out_h * out_w * sizeof(float));
     }
     return result;
 }
 
-// 预处理：不再 Resize，直接对原图进行像素级 Box-Cox 变换
-std::vector<float> DataProcessor::preprocess(const cv::Mat& raw_img, float lam, float eps) {
-    cv::Mat u, y;
-    cv::max(raw_img, 0.0f, raw_img); // 修正可能存在的负值
-    cv::add(raw_img, 1.0f + eps, u); 
-    cv::pow(u, lam, y);
-    cv::subtract(y, 1.0f, y);
-    cv::divide(y, lam, y);
+void DataProcessor::saveVisualImage(const cv::Mat& img, const std::string& save_path, float vmax, const std::string& info_text) {
+    cv::Mat vis(img.size(), CV_8U);
     
-    // 返回一维向量供 TensorRT 使用
-    if (y.isContinuous()) {
-        return std::vector<float>((float*)y.data, (float*)y.data + y.total());
-    } else {
-        cv::Mat cont = y.clone();
-        return std::vector<float>((float*)cont.data, (float*)cont.data + cont.total());
-    }
-}
-
-// 后处理：执行反向变换，并使用 NORM_MINMAX 归一化解决黑图问题
-cv::Mat DataProcessor::postprocess(const std::vector<float>& infer_out, int w, int h, float lam, float eps) {
-    cv::Mat y(h, w, CV_32FC1, (void*)infer_out.data());
-    cv::Mat u, x, final_8u;
-
-    cv::multiply(y, lam, u);
-    cv::add(u, 1.0f, u);
-    cv::max(u, eps, u); 
-    cv::pow(u, 1.0f / lam, x);
-    cv::subtract(x, 1.0f + eps, x);
-
-    // 自动将图像拉伸到 0-255 亮度范围
-    cv::normalize(x, final_8u, 0, 255, cv::NORM_MINMAX);
-    final_8u.convertTo(final_8u, CV_8U);
-    return final_8u;
-}
-
-void DataProcessor::saveVisualImage(const cv::Mat& img, const std::string& save_path, const std::string& info_text) {
-    cv::Mat vis;
-    if (img.depth() != CV_8U) {
-        cv::normalize(img, vis, 0, 255, cv::NORM_MINMAX);
-        vis.convertTo(vis, CV_8U);
-    } else {
-        vis = img.clone();
+    for (int r = 0; r < img.rows; ++r) {
+        const float* src = img.ptr<float>(r);
+        uchar* dst = vis.ptr<uchar>(r);
+        for (int c = 0; c < img.cols; ++c) {
+            float val = std::max(src[c], 0.0f);
+            if (vmax <= 1e-8f) {
+                dst[c] = 0;
+            } else {
+                val = std::min(val, vmax);
+                // 线性归一化到 0~255
+                float out_val = (val / (vmax + 1e-8f)) * 255.0f;
+                
+                // 【画质对齐核心修复】
+                // 之前使用的 std::round 是"四舍五入"(2.5->3)
+                // 而 Python 里的 numpy.rint 是"银行家舍入/偶数舍入"(2.5->2, 3.5->4)
+                // C++ 中的 std::rint() 才是严格与 Python 底层一致的！这消除了 ±1 像素的取整误差
+                dst[c] = static_cast<uchar>(std::clamp(std::rint(out_val), 0.0f, 255.0f)); 
+            }
+        }
     }
 
+    // 转为 BGR，用于在图上用彩色绘制信息文本
     cv::Mat vis_color;
     cv::cvtColor(vis, vis_color, cv::COLOR_GRAY2BGR);
     if (!info_text.empty()) {
